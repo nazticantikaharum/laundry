@@ -1,9 +1,9 @@
-
 <?php
 session_start();
 
 require_once "koneksi.php";
 require_once "midtrans_config.php";
+require_once "midtrans_sync.php";   // <-- (a) BARU: fungsi sinkron status Midtrans
 
 date_default_timezone_set("Asia/Jakarta");
 
@@ -509,6 +509,12 @@ if (isset($_GET["status"])) {
 }
 
 /* =========================================
+   (b) BARU: SINKRON STATUS PEMBAYARAN DARI MIDTRANS
+   Harus berada SEBELUM query data form, snap, ringkasan, dan daftar.
+========================================= */
+sinkronkanPembayaran($conn);
+
+/* =========================================
    DATA FORM
 ========================================= */
 $daftarPelanggan = mysqli_query($conn,
@@ -559,7 +565,7 @@ if (($_GET["status"] ?? "") === "snap") {
     }
 
     if (!$dataSnap || empty($dataSnap["snap_token"])) {
-        $error = "Token pembayaran tidak ditemukan. Silakan periksa riwayat pembayaran.";
+        $error = "Token pembayaran tidak ditemukan atau pembayaran sudah selesai. Silakan periksa riwayat pembayaran.";
     }
 }
 
@@ -1757,6 +1763,16 @@ function tampilkanTagihan() {
         total > 0 ? "Rp " + total.toLocaleString("id-ID") : "";
 }
 
+// (c) BARU: SINKRON STATUS KE SERVER
+async function sinkronStatus() {
+    try {
+        const res = await fetch("sync_pending.php", { cache: "no-store" });
+        return await res.json();
+    } catch (e) {
+        return null;
+    }
+}
+
 // MIDTRANS SNAP
 <?php if ($dataSnap && !empty($dataSnap["snap_token"])): ?>
 
@@ -1770,31 +1786,23 @@ document.addEventListener("DOMContentLoaded", function () {
             snap.pay(
                 <?= json_encode($dataSnap["snap_token"]) ?>,
                 {
-                    onSuccess: function (result) {
-                        alert(
-                            "Pembayaran berhasil diproses. " +
-                            "Status pembayaran akan diperbarui setelah verifikasi Midtrans."
-                        );
-
+                    onSuccess: async function (result) {
+                        await sinkronStatus();
                         window.location.href = "transaksi.php";
                     },
 
-                    onPending: function (result) {
-                        alert(
-                            "Pembayaran masih menunggu. Silakan selesaikan pembayaran."
-                        );
+                    onPending: async function (result) {
+                        await sinkronStatus();
+                        window.location.href = "transaksi.php";
                     },
 
                     onError: function (result) {
-                        alert(
-                            "Pembayaran gagal diproses. Silakan coba kembali."
-                        );
+                        alert("Pembayaran gagal diproses. Silakan coba kembali.");
                     },
 
-                    onClose: function () {
-                        alert(
-                            "Kamu menutup halaman pembayaran sebelum menyelesaikannya."
-                        );
+                    onClose: async function () {
+                        await sinkronStatus();
+                        window.location.href = "transaksi.php";
                     }
                 }
             );
@@ -1803,6 +1811,34 @@ document.addEventListener("DOMContentLoaded", function () {
     }
 
 });
+
+<?php endif; ?>
+
+// (c) BARU: AUTO-REFRESH KALAU MASIH ADA YANG MENUNGGU
+<?php if ((int)$dataMenunggu["jumlah"] > 0 && !$dataSnap): ?>
+
+(function () {
+    let sedangCek = false;
+    let percobaan = 0;
+
+    const timer = setInterval(async function () {
+        if (sedangCek) return;
+        sedangCek = true;
+        percobaan++;
+
+        const data = await sinkronStatus();
+        sedangCek = false;
+
+        if (data && data.berubah > 0) {
+            clearInterval(timer);
+            window.location.reload();
+        } else if (data && data.menunggu === 0) {
+            clearInterval(timer);
+        }
+
+        if (percobaan >= 60) clearInterval(timer); // berhenti setelah ±5 menit
+    }, 5000);
+})();
 
 <?php endif; ?>
 
