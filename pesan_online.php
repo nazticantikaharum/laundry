@@ -1,1429 +1,352 @@
-
 <?php
-session_start();
+// Halaman PUBLIK: tidak ada session login, tidak ada sidebar, tidak ada dashboard.
 require_once "koneksi.php";
-
-if (!isset($_SESSION["id_user"])) {
-    header("Location: login.php");
-    exit;
-}
-
 date_default_timezone_set("Asia/Jakarta");
 
-// =====================================
-// DATA AKUN
-// =====================================
-$namaUser = $_SESSION["nama"] ?? "Pengguna";
-$roleUser = $_SESSION["role"] ?? "Petugas";
-$isAdmin = strtolower($roleUser) === "admin";
-$labelRole = $isAdmin ? "Administrator" : "Petugas";
-
-// =====================================
-// FORMAT RUPIAH
-// =====================================
-function rupiah($angka) {
-    return "Rp " . number_format((float)$angka, 0, ",", ".");
+function aman($data) {
+    return htmlspecialchars($data ?? "", ENT_QUOTES, "UTF-8");
 }
 
-function hitungData($conn, $sql) {
-    $result = mysqli_query($conn, $sql);
+$error = "";
+$kodeTracking = "";
+$input = [
+    "nama"    => "",
+    "no_hp"   => "",
+    "alamat"  => "",
+    "layanan" => (int)($_GET["layanan"] ?? 0),
+    "berat"   => "",
+    "catatan" => ""
+];
 
-    if (!$result) {
-        return 0;
+// DATA LAYANAN
+$daftarLayanan = [];
+$resLayanan = mysqli_query($conn,
+    "SELECT id_layanan, nama_layanan, jenis_waktu, estimasi_hari, harga_per_kg
+     FROM layanan ORDER BY nama_layanan ASC, jenis_waktu ASC"
+);
+while ($resLayanan && $l = mysqli_fetch_assoc($resLayanan)) {
+    $daftarLayanan[(int)$l["id_layanan"]] = $l;
+}
+
+// PROSES FORM
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+
+    $input["nama"]    = trim($_POST["nama"] ?? "");
+    $input["no_hp"]   = trim($_POST["no_hp"] ?? "");
+    $input["alamat"]  = trim($_POST["alamat"] ?? "");
+    $input["layanan"] = (int)($_POST["id_layanan"] ?? 0);
+    $input["berat"]   = trim($_POST["berat"] ?? "");
+    $input["catatan"] = trim($_POST["catatan"] ?? "");
+
+    $berat = (float)str_replace(",", ".", $input["berat"]);
+    $noHpBersih = preg_replace('/[^0-9+]/', '', $input["no_hp"]);
+
+    if ($input["nama"] === "" || $input["alamat"] === "") {
+        $error = "Nama dan alamat wajib diisi.";
+    } elseif (!preg_match('/^(\+62|62|0)[0-9]{8,13}$/', $noHpBersih)) {
+        $error = "Nomor WhatsApp tidak valid. Contoh: 081234567890.";
+    } elseif (!isset($daftarLayanan[$input["layanan"]])) {
+        $error = "Silakan pilih layanan terlebih dahulu.";
+    } elseif ($berat <= 0 || $berat > 100) {
+        $error = "Berat estimasi harus antara 0,1 sampai 100 Kg.";
+    } else {
+
+        $idLayanan = $input["layanan"];
+        $catatan = $input["catatan"] !== "" ? $input["catatan"] : "-";
+        $status = "Menunggu Konfirmasi";
+
+        // kode tracking unik (16 karakter hex), coba ulang jika bentrok
+        $berhasil = false;
+        for ($i = 0; $i < 5 && !$berhasil; $i++) {
+
+            $kode = strtoupper(bin2hex(random_bytes(8)));
+
+            $stmt = mysqli_prepare($conn,
+                "INSERT INTO pemesanan_online
+                 (nama_pelanggan, no_hp, alamat, id_layanan, berat_estimasi,
+                  catatan, tanggal_pesan, status, kode_tracking)
+                 VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?)"
+            );
+
+            mysqli_stmt_bind_param(
+                $stmt, "sssidsss",
+                $input["nama"], $noHpBersih, $input["alamat"],
+                $idLayanan, $berat, $catatan, $status, $kode
+            );
+
+            try {
+                $berhasil = mysqli_stmt_execute($stmt);
+            } catch (Throwable $e) {
+                $berhasil = false; // kemungkinan kode_tracking bentrok, ulangi
+            }
+
+            mysqli_stmt_close($stmt);
+
+            if ($berhasil) {
+                $kodeTracking = $kode;
+            }
+        }
+
+        if (!$berhasil) {
+            $error = "Pesanan gagal disimpan. Silakan coba lagi.";
+        }
     }
-
-    $data = mysqli_fetch_assoc($result);
-    return $data["total"] ?? 0;
 }
-
-// =====================================
-// FILTER TANGGAL
-// =====================================
-$tanggal_awal = $_GET["tanggal_awal"] ?? date("Y-m-01");
-$tanggal_akhir = $_GET["tanggal_akhir"] ?? date("Y-m-d");
-
-if (
-    !preg_match('/^\d{4}-\d{2}-\d{2}$/', $tanggal_awal) ||
-    !preg_match('/^\d{4}-\d{2}-\d{2}$/', $tanggal_akhir) ||
-    $tanggal_awal > $tanggal_akhir
-) {
-    $tanggal_awal = date("Y-m-01");
-    $tanggal_akhir = date("Y-m-d");
-}
-
-// =====================================
-// TOTAL PELANGGAN
-// =====================================
-$total_pelanggan = hitungData(
-    $conn,
-    "SELECT COUNT(*) AS total FROM pelanggan"
-);
-
-// =====================================
-// TOTAL LAYANAN
-// =====================================
-$total_layanan = hitungData(
-    $conn,
-    "SELECT COUNT(*) AS total FROM layanan"
-);
-
-// =====================================
-// TOTAL PESANAN
-// =====================================
-$stmt = mysqli_prepare(
-    $conn,
-    "SELECT COUNT(*) AS total
-     FROM pesanan
-     WHERE DATE(tanggal_masuk) BETWEEN ? AND ?"
-);
-
-mysqli_stmt_bind_param($stmt, "ss", $tanggal_awal, $tanggal_akhir);
-mysqli_stmt_execute($stmt);
-
-$total_pesanan = mysqli_fetch_assoc(
-    mysqli_stmt_get_result($stmt)
-)["total"] ?? 0;
-
-// =====================================
-// TOTAL PENDAPATAN
-// =====================================
-$stmt = mysqli_prepare(
-    $conn,
-    "SELECT COALESCE(SUM(jumlah_bayar), 0) AS total
-     FROM pembayaran
-     WHERE status_bayar = 'Berhasil'
-     AND DATE(tanggal_bayar) BETWEEN ? AND ?"
-);
-
-mysqli_stmt_bind_param($stmt, "ss", $tanggal_awal, $tanggal_akhir);
-mysqli_stmt_execute($stmt);
-
-$total_pendapatan = mysqli_fetch_assoc(
-    mysqli_stmt_get_result($stmt)
-)["total"] ?? 0;
-
-// =====================================
-// PESANAN DIPROSES
-// =====================================
-$stmt = mysqli_prepare(
-    $conn,
-    "SELECT COUNT(*) AS total
-     FROM pesanan
-     WHERE status = 'Diproses'
-     AND DATE(tanggal_masuk) BETWEEN ? AND ?"
-);
-
-mysqli_stmt_bind_param($stmt, "ss", $tanggal_awal, $tanggal_akhir);
-mysqli_stmt_execute($stmt);
-
-$total_proses = mysqli_fetch_assoc(
-    mysqli_stmt_get_result($stmt)
-)["total"] ?? 0;
-
-// =====================================
-// SISA TAGIHAN
-// =====================================
-$sqlTagihan = "
-    SELECT COALESCE(
-        SUM(
-            GREATEST(
-                p.total_harga - COALESCE(b.dibayar, 0),
-                0
-            )
-        ), 0
-    ) AS total
-    FROM pesanan p
-    LEFT JOIN (
-        SELECT id_pesanan, SUM(jumlah_bayar) AS dibayar
-        FROM pembayaran
-        WHERE status_bayar = 'Berhasil'
-        GROUP BY id_pesanan
-    ) b ON p.id_pesanan = b.id_pesanan
-    WHERE p.status != 'Dibatalkan'
-    AND DATE(p.tanggal_masuk) BETWEEN ? AND ?
-";
-
-$stmt = mysqli_prepare($conn, $sqlTagihan);
-mysqli_stmt_bind_param($stmt, "ss", $tanggal_awal, $tanggal_akhir);
-mysqli_stmt_execute($stmt);
-
-$sisa_tagihan = mysqli_fetch_assoc(
-    mysqli_stmt_get_result($stmt)
-)["total"] ?? 0;
-
-// =====================================
-// JUMLAH PEMBAYARAN BERHASIL
-// =====================================
-$stmt = mysqli_prepare(
-    $conn,
-    "SELECT COUNT(*) AS total
-     FROM pembayaran
-     WHERE status_bayar = 'Berhasil'
-     AND DATE(tanggal_bayar) BETWEEN ? AND ?"
-);
-
-mysqli_stmt_bind_param($stmt, "ss", $tanggal_awal, $tanggal_akhir);
-mysqli_stmt_execute($stmt);
-
-$pembayaran_berhasil = mysqli_fetch_assoc(
-    mysqli_stmt_get_result($stmt)
-)["total"] ?? 0;
-
-// =====================================
-// PEMBAYARAN MENUNGGU
-// =====================================
-$stmt = mysqli_prepare(
-    $conn,
-    "SELECT COUNT(*) AS total
-     FROM pembayaran
-     WHERE status_bayar = 'Menunggu'
-     AND DATE(tanggal_bayar) BETWEEN ? AND ?"
-);
-
-mysqli_stmt_bind_param($stmt, "ss", $tanggal_awal, $tanggal_akhir);
-mysqli_stmt_execute($stmt);
-
-$pembayaran_menunggu = mysqli_fetch_assoc(
-    mysqli_stmt_get_result($stmt)
-)["total"] ?? 0;
-
-// =====================================
-// GRAFIK PENDAPATAN
-// =====================================
-$stmt = mysqli_prepare(
-    $conn,
-    "SELECT DATE(tanggal_bayar) AS tanggal,
-            SUM(jumlah_bayar) AS total
-     FROM pembayaran
-     WHERE status_bayar = 'Berhasil'
-     AND DATE(tanggal_bayar) BETWEEN ? AND ?
-     GROUP BY DATE(tanggal_bayar)
-     ORDER BY tanggal ASC"
-);
-
-mysqli_stmt_bind_param($stmt, "ss", $tanggal_awal, $tanggal_akhir);
-mysqli_stmt_execute($stmt);
-
-$resultGrafik = mysqli_stmt_get_result($stmt);
-
-$labelPendapatan = [];
-$dataPendapatan = [];
-
-while ($row = mysqli_fetch_assoc($resultGrafik)) {
-    $labelPendapatan[] = date("d M", strtotime($row["tanggal"]));
-    $dataPendapatan[] = (float)$row["total"];
-}
-
-// =====================================
-// GRAFIK STATUS PESANAN
-// =====================================
-$stmt = mysqli_prepare(
-    $conn,
-    "SELECT status, COUNT(*) AS jumlah
-     FROM pesanan
-     WHERE DATE(tanggal_masuk) BETWEEN ? AND ?
-     GROUP BY status"
-);
-
-mysqli_stmt_bind_param($stmt, "ss", $tanggal_awal, $tanggal_akhir);
-mysqli_stmt_execute($stmt);
-
-$resultStatus = mysqli_stmt_get_result($stmt);
-
-$labelStatus = [];
-$dataStatus = [];
-
-while ($row = mysqli_fetch_assoc($resultStatus)) {
-    $labelStatus[] = $row["status"];
-    $dataStatus[] = (int)$row["jumlah"];
-}
-
-// =====================================
-// ANALISIS PESANAN DAN PEMBAYARAN
-// =====================================
-$sqlAnalisis = "
-    SELECT
-        p.kode_pesanan,
-        pl.nama AS nama_pelanggan,
-        p.tanggal_masuk,
-        p.status,
-        p.total_harga,
-        COALESCE(b.dibayar, 0) AS sudah_dibayar,
-        GREATEST(
-            p.total_harga - COALESCE(b.dibayar, 0),
-            0
-        ) AS sisa_tagihan
-    FROM pesanan p
-    JOIN pelanggan pl
-        ON p.id_pelanggan = pl.id_pelanggan
-    LEFT JOIN (
-        SELECT id_pesanan, SUM(jumlah_bayar) AS dibayar
-        FROM pembayaran
-        WHERE status_bayar = 'Berhasil'
-        GROUP BY id_pesanan
-    ) b ON p.id_pesanan = b.id_pesanan
-    WHERE DATE(p.tanggal_masuk) BETWEEN ? AND ?
-    ORDER BY p.id_pesanan DESC
-    LIMIT 10
-";
-
-$stmt = mysqli_prepare($conn, $sqlAnalisis);
-mysqli_stmt_bind_param($stmt, "ss", $tanggal_awal, $tanggal_akhir);
-mysqli_stmt_execute($stmt);
-
-$queryAnalisis = mysqli_stmt_get_result($stmt);
-
-// =====================================
-// PESANAN TERBARU
-// =====================================
-$queryTerbaru = mysqli_query(
-    $conn,
-    "SELECT
-        p.kode_pesanan,
-        pl.nama AS nama_pelanggan,
-        l.nama_layanan,
-        p.tanggal_masuk,
-        p.total_harga,
-        p.status
-    FROM pesanan p
-    JOIN pelanggan pl ON p.id_pelanggan = pl.id_pelanggan
-    JOIN layanan l ON p.id_layanan = l.id_layanan
-    ORDER BY p.id_pesanan DESC
-    LIMIT 5"
-);
-
 ?>
-
 <!DOCTYPE html>
 <html lang="id">
 <head>
-
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
-<title>Dashboard | Teman.Nyuci</title>
-
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<title>Pesan Laundry | Teman.Nyuci</title>
 
 <link rel="stylesheet"
 href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
 
 <style>
+:root {
+    --navy: #092D50;
+    --blue: #087FC1;
+    --ice: #EAF6FD;
+    --yellow: #FFDA45;
+    --text: #30465D;
+    --muted: #7D8FA2;
+    --border: #E5EDF4;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: "Segoe UI", Arial, sans-serif; color: var(--text); background: #F3F9FD; }
+a { text-decoration: none; }
 
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
+/* NAVBAR (sama dengan beranda) */
+.navbar {
+    position: sticky; top: 0; z-index: 1000; width: 100%;
+    background: rgba(255,255,255,.97); backdrop-filter: blur(12px);
+    padding: 13px 7%; display: flex; align-items: center;
+    justify-content: space-between; border-bottom: 1px solid var(--border);
+}
+.logo-area { display: flex; align-items: center; gap: 10px; }
+.logo-area img { width: 48px; height: 48px; object-fit: contain; }
+.logo-text { color: var(--navy); font-size: 22px; font-weight: 800; }
+.logo-text span { color: var(--blue); }
+.nav-menu { display: flex; align-items: center; gap: 27px; }
+.nav-menu a { color: #52677D; font-size: 13px; font-weight: 600; transition: .2s; }
+.nav-menu a:hover { color: var(--blue); }
+.nav-menu .login-btn { color: white; background: var(--navy); padding: 12px 19px; border-radius: 8px; }
+.nav-menu .login-btn:hover { background: var(--blue); color: white; }
+
+.wrap { max-width: 760px; margin: 45px auto; padding: 0 20px; }
+.heading { text-align: center; margin-bottom: 28px; }
+.heading small { color: var(--blue); font-size: 11px; font-weight: 800; letter-spacing: 1.7px; }
+.heading h1 { color: var(--navy); font-size: 29px; margin: 10px 0; }
+.heading p { color: #8797A8; font-size: 13px; line-height: 1.8; }
+
+.card {
+    background: white; border: 1px solid var(--border); border-radius: 16px;
+    padding: 30px; box-shadow: 0 10px 28px rgba(9,45,80,.06);
+}
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; }
+.full { grid-column: 1 / -1; }
+label { display: block; margin-bottom: 8px; font-size: 12px; font-weight: 600; color: #526277; }
+input, select, textarea {
+    width: 100%; padding: 12px 13px; border: 1px solid #dfe8f1; border-radius: 8px;
+    font-size: 13px; color: #34445a; background: white; outline: none; font-family: inherit;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--blue); }
+input[readonly] { background: #f3f7fc; }
+textarea { resize: vertical; min-height: 85px; }
+
+.btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 9px;
+    padding: 14px 22px; border-radius: 9px; font-size: 13px; font-weight: 700;
+    border: none; cursor: pointer; font-family: inherit; transition: .25s;
+}
+.btn-primary { background: var(--navy); color: white; }
+.btn-primary:hover { background: var(--blue); }
+.btn-outline { background: white; color: var(--navy); border: 1px solid #C9DFEE; }
+.btn-outline:hover { background: var(--ice); }
+.submit { width: 100%; margin-top: 22px; }
+
+.alert-error {
+    background: #fff0f0; color: #b83232; border: 1px solid #f5dddd;
+    padding: 13px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 13px;
 }
 
-body {
-    font-family: 'Segoe UI', Arial, sans-serif;
-    background: #F3F7FC;
-    color: #34445A;
+/* SUKSES */
+.success { text-align: center; }
+.success .icon {
+    width: 70px; height: 70px; margin: 0 auto 18px; border-radius: 50%;
+    display: grid; place-items: center; background: #eaf5ee; color: #277344; font-size: 30px;
 }
-
-/* =====================================
-   KONTEN UTAMA
-===================================== */
-
-.main {
-    margin-left: 235px;
-    padding: 25px 30px;
-    min-height: 100vh;
+.success h2 { color: var(--navy); font-size: 22px; margin-bottom: 10px; }
+.success p { color: #8797A8; font-size: 13px; line-height: 1.8; }
+.kode-box {
+    margin: 22px auto; padding: 16px; max-width: 360px; background: var(--ice);
+    border: 1px dashed #9ccbe8; border-radius: 12px;
 }
-
-/* HEADER */
-.top-header {
-    background: #FFFFFF;
-    border: 1px solid #E7EEF6;
-    border-radius: 11px;
-    padding: 16px 22px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 25px;
-}
-
-.header-title h1 {
-    font-size: 20px;
-    color: #092D50;
-    font-weight: 700;
-}
-
-.header-title p {
-    font-size: 12px;
-    color: #8999AA;
-    margin-top: 5px;
-}
-
-.header-right {
-    display: flex;
-    align-items: center;
-    gap: 18px;
-}
-
-.date-now {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    color: #647A90;
-}
-
-.date-now i {
-    color: #087FC1;
-}
-
-.header-user {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    padding-left: 17px;
-    border-left: 1px solid #E8EEF4;
-}
-
-.header-avatar {
-    width: 34px;
-    height: 34px;
-    border-radius: 50%;
-    background: #E3F2FC;
-    color: #087FC1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-weight: bold;
-}
-
-.header-user strong {
-    display: block;
-    color: #092D50;
-    font-size: 12px;
-}
-
-.header-user span {
-    display: block;
-    color: #91A0AE;
-    font-size: 10px;
-    margin-top: 3px;
-}
-
-/* =====================================
-   JUDUL HALAMAN
-===================================== */
-
-.page-heading {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 18px;
-}
-
-.page-heading h2 {
-    color: #092D50;
-    font-size: 19px;
-    margin-bottom: 5px;
-}
-
-.page-heading p {
-    font-size: 12px;
-    color: #8A9BAC;
-}
-
-/* =====================================
-   FILTER TANGGAL
-===================================== */
-
-.filter-box {
-    display: flex;
-    justify-content: flex-end;
-    margin-bottom: 20px;
-}
-
-.filter-box form {
-    display: flex;
-    align-items: end;
-    gap: 9px;
-    flex-wrap: wrap;
-}
-
-.filter-group label {
-    display: block;
-    font-size: 11px;
-    color: #71869A;
-    margin-bottom: 6px;
-}
-
-.filter-group input {
-    height: 37px;
-    border: 1px solid #DCE7F0;
-    border-radius: 7px;
-    padding: 0 10px;
-    color: #526A80;
-    background: #FFFFFF;
-    outline: none;
-}
-
-.filter-group input:focus {
-    border-color: #087FC1;
-}
-
-.btn-filter {
-    height: 37px;
-    padding: 0 15px;
-    background: #087FC1;
-    color: #FFFFFF;
-    border: none;
-    border-radius: 7px;
-    cursor: pointer;
-    font-size: 12px;
-}
-
-.btn-filter:hover {
-    background: #092D50;
-}
-
-.btn-reset {
-    height: 37px;
-    display: flex;
-    align-items: center;
-    padding: 0 13px;
-    color: #087FC1;
-    background: #EAF6FC;
-    text-decoration: none;
-    border-radius: 7px;
-    font-size: 12px;
-}
-
-/* =====================================
-   KARTU STATISTIK
-===================================== */
-
-.cards {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 15px;
-    margin-bottom: 22px;
-}
-
-.stat-card {
-    background: #FFFFFF;
-    border: 1px solid #E7EEF6;
-    border-radius: 11px;
-    padding: 17px;
-    box-shadow: 0 3px 12px rgba(9,45,80,0.035);
-    min-width: 0;
-    transition: .2s;
-}
-
-.stat-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 7px 18px rgba(9,45,80,0.08);
-}
-
-.stat-top {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 14px;
-}
-
-.stat-icon {
-    width: 36px;
-    height: 36px;
-    border-radius: 9px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 14px;
-    flex-shrink: 0;
-}
-
-.blue {
-    background: #E5F3FC;
-    color: #087FC1;
-}
-
-.green {
-    background: #E5F6EF;
-    color: #40A981;
-}
-
-.orange {
-    background: #FFF3DF;
-    color: #D99A37;
-}
-
-.purple {
-    background: #F0EBFF;
-    color: #9279D0;
-}
-
-.cyan {
-    background: #E2F7FA;
-    color: #26A2B8;
-}
-
-.red {
-    background: #FFF0F0;
-    color: #D96E6E;
-}
-
-.stat-label {
-    color: #8293A4;
-    font-size: 11px;
-    line-height: 1.4;
-}
-
-.stat-card h2 {
-    color: #092D50;
-    font-size: 21px;
-    font-weight: 700;
-    overflow-wrap: anywhere;
-}
-
-.stat-card small {
-    display: block;
-    margin-top: 6px;
-    color: #A0ACB9;
-    font-size: 10px;
-}
-
-/* =====================================
-   GRAFIK
-===================================== */
-
-.chart-grid {
-    display: grid;
-    grid-template-columns: 1.6fr 1fr;
-    gap: 17px;
-    margin-bottom: 20px;
-}
-
-.chart-box {
-    background: #FFFFFF;
-    border: 1px solid #E7EEF6;
-    border-radius: 11px;
-    padding: 20px;
-    min-width: 0;
-    box-shadow: 0 3px 12px rgba(9,45,80,0.035);
-}
-
-.chart-title {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    font-size: 13px;
-    font-weight: 650;
-    margin-bottom: 18px;
-    color: #092D50;
-}
-
-.chart-title i {
-    color: #087FC1;
-}
-
-.chart-container {
-    height: 250px;
-    position: relative;
-}
-
-/* =====================================
-   TABEL
-===================================== */
-
-.table-box {
-    background: #FFFFFF;
-    border: 1px solid #E7EEF6;
-    border-radius: 11px;
-    padding: 20px;
-    margin-bottom: 20px;
-    overflow-x: auto;
-    box-shadow: 0 3px 12px rgba(9,45,80,0.035);
-}
-
-.table-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 17px;
-}
-
-.table-header h3 {
-    font-size: 14px;
-    color: #092D50;
-}
-
-.table-header span {
-    color: #93A2B0;
-    font-size: 11px;
-}
-
-table {
-    width: 100%;
-    border-collapse: collapse;
-    min-width: 750px;
-}
-
-th {
-    text-align: left;
-    color: #71869A;
-    font-size: 11px;
-    font-weight: 600;
-    background: #F3F8FC;
-    padding: 13px 11px;
-    white-space: nowrap;
-}
-
-td {
-    padding: 13px 11px;
-    border-bottom: 1px solid #EDF2F6;
-    font-size: 11px;
-    color: #5F7388;
-}
-
-tbody tr:hover {
-    background: #F8FBFE;
-}
-
-.status {
-    display: inline-block;
-    padding: 6px 9px;
-    border-radius: 5px;
-    font-size: 10px;
-    background: #EAF4FC;
-    color: #087FC1;
-}
-
-.tagihan {
-    color: #D96E6E;
-    font-weight: 650;
-}
-
-.lunas {
-    color: #40A981;
-    font-weight: 650;
-}
-
-.empty {
-    text-align: center;
-    color: #9AA8B7;
-    padding: 25px;
-}
-
-/* FOOTER */
-.dashboard-footer {
-    text-align: center;
-    color: #9AAABD;
-    font-size: 11px;
-    padding: 12px 0 5px;
-}
-
-/* =====================================
-   RESPONSIVE
-===================================== */
-
-@media (max-width: 1200px) {
-    .cards {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .chart-grid {
-        grid-template-columns: 1fr;
-    }
-}
+.kode-box small { display: block; color: var(--muted); font-size: 11px; margin-bottom: 6px; }
+.kode-box strong { color: var(--navy); font-size: 21px; letter-spacing: 2px; }
+.success .actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 8px; }
 
 @media (max-width: 700px) {
-    .main {
-        margin-left: 0;
-        padding: 18px;
-    }
-
-    .top-header {
-        align-items: flex-start;
-        flex-direction: column;
-        gap: 15px;
-    }
-
-    .header-right {
-        width: 100%;
-        justify-content: space-between;
-    }
-
-    .page-heading {
-        align-items: flex-start;
-        flex-direction: column;
-        gap: 10px;
-    }
-
-    .cards {
-        grid-template-columns: 1fr;
-    }
-
-    .filter-box {
-        justify-content: flex-start;
-    }
-
-    .filter-box form {
-        width: 100%;
-    }
-
-    .filter-group {
-        flex: 1;
-        min-width: 125px;
-    }
-
-    .filter-group input {
-        width: 100%;
-    }
-
-    .table-header {
-        align-items: flex-start;
-        flex-direction: column;
-        gap: 7px;
-    }
+    .navbar { flex-direction: column; gap: 12px; }
+    .nav-menu { flex-wrap: wrap; justify-content: center; gap: 12px 17px; }
+    .nav-menu a { font-size: 11px; }
+    .grid { grid-template-columns: 1fr; }
+    .card { padding: 22px 18px; }
 }
-
 </style>
 </head>
 
 <body>
 
-<!-- SIDEBAR DARI FILE TERPISAH -->
-<?php include "sidebar.php"; ?>
+<!-- NAVBAR PUBLIK: tidak ada sidebar / menu dashboard -->
+<nav class="navbar">
+    <a href="beranda_pelanggan.php" class="logo-area">
+        <img src="image/logo-teman-nyuci.jpeg" alt="Logo Teman.Nyuci">
+        <div class="logo-text">Teman<span>.Nyuci</span></div>
+    </a>
 
-<!-- =====================================
-     KONTEN DASHBOARD
-===================================== -->
+    <div class="nav-menu">
+        <a href="beranda_pelanggan.php">Beranda</a>
+        <a href="beranda_pelanggan.php#layanan">Layanan</a>
+        <a href="beranda_pelanggan.php#cara-pesan">Cara Pesan</a>
+        <a href="lacak_pesanan.php">Lacak Pesanan</a>
+        <a href="faq.php">FAQ</a>
+        <a href="login.php" class="login-btn">Login Petugas</a>
+    </div>
+</nav>
 
-<div class="main">
+<div class="wrap">
 
-    <!-- HEADER ATAS -->
-    <div class="top-header">
+    <div class="heading">
+        <small>PEMESANAN ONLINE</small>
+        <h1>Pesan Laundry Sekarang</h1>
+        <p>Isi formulir berikut. Petugas akan memeriksa dan mengonfirmasi pesanan Anda.</p>
+    </div>
 
-        <div class="header-title">
-            <h1>Dashboard</h1>
-            <p>Ringkasan operasional Teman.Nyuci</p>
-        </div>
+    <div class="card">
 
-        <div class="header-right">
+    <?php if ($kodeTracking !== ""): ?>
 
-            <div class="date-now">
-                <i class="fa-regular fa-calendar"></i>
-                <?= date("d F Y") ?>
+        <div class="success">
+            <div class="icon"><i class="fa-solid fa-check"></i></div>
+            <h2>Pesanan Berhasil Dikirim!</h2>
+            <p>
+                Terima kasih, <?= aman($input["nama"]) ?>.<br>
+                Simpan kode tracking di bawah ini untuk memantau status pesanan Anda.
+            </p>
+
+            <div class="kode-box">
+                <small>KODE TRACKING</small>
+                <strong><?= aman($kodeTracking) ?></strong>
             </div>
 
-            <div class="header-user">
+            <div class="actions">
+                <a href="lacak_pesanan.php" class="btn btn-primary">
+                    <i class="fa-solid fa-magnifying-glass"></i> Lacak Pesanan
+                </a>
+                <a href="beranda_pelanggan.php" class="btn btn-outline">
+                    <i class="fa-solid fa-house"></i> Kembali ke Beranda
+                </a>
+            </div>
+        </div>
 
-                <div class="header-avatar">
-                    <?= htmlspecialchars(strtoupper(substr($namaUser, 0, 1))) ?>
+    <?php else: ?>
+
+        <?php if ($error): ?>
+            <div class="alert-error">
+                <i class="fa-solid fa-circle-exclamation"></i> <?= aman($error) ?>
+            </div>
+        <?php endif; ?>
+
+        <form method="POST" autocomplete="off">
+
+            <div class="grid">
+
+                <div>
+                    <label>Nama Lengkap</label>
+                    <input type="text" name="nama" required maxlength="100"
+                           value="<?= aman($input["nama"]) ?>" placeholder="Nama Anda">
                 </div>
 
                 <div>
-                    <strong>
-                        <?= htmlspecialchars($namaUser) ?>
-                    </strong>
+                    <label>Nomor WhatsApp</label>
+                    <input type="tel" name="no_hp" required maxlength="20"
+                           value="<?= aman($input["no_hp"]) ?>" placeholder="081234567890">
+                </div>
 
-                    <span>
-                        <?= htmlspecialchars($labelRole) ?>
-                    </span>
+                <div class="full">
+                    <label>Alamat Penjemputan / Pengantaran</label>
+                    <textarea name="alamat" required placeholder="Alamat lengkap"><?= aman($input["alamat"]) ?></textarea>
+                </div>
+
+                <div class="full">
+                    <label>Pilih Layanan</label>
+                    <select name="id_layanan" id="layanan" required onchange="hitung()">
+                        <option value="">-- Pilih Layanan --</option>
+                        <?php foreach ($daftarLayanan as $id => $l): ?>
+                            <option
+                                value="<?= $id ?>"
+                                data-harga="<?= (float)$l["harga_per_kg"] ?>"
+                                data-estimasi="<?= (int)$l["estimasi_hari"] ?>"
+                                <?= $input["layanan"] === $id ? "selected" : "" ?>
+                            >
+                                <?= aman($l["nama_layanan"]) ?> - <?= aman($l["jenis_waktu"]) ?>
+                                (Rp <?= number_format((float)$l["harga_per_kg"], 0, ",", ".") ?>/Kg)
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div>
+                    <label>Berat Estimasi (Kg)</label>
+                    <input type="number" name="berat" id="berat" min="0.1" max="100" step="0.1"
+                           required value="<?= aman($input["berat"]) ?>" oninput="hitung()"
+                           placeholder="Contoh: 3">
+                </div>
+
+                <div>
+                    <label>Estimasi Pengerjaan</label>
+                    <input type="text" id="estimasi" readonly placeholder="Otomatis">
+                </div>
+
+                <div class="full">
+                    <label>Perkiraan Total (final menyesuaikan timbangan)</label>
+                    <input type="text" id="total" readonly placeholder="Otomatis">
+                </div>
+
+                <div class="full">
+                    <label>Catatan (opsional)</label>
+                    <textarea name="catatan" placeholder="Contoh: pisahkan pakaian putih"><?= aman($input["catatan"]) ?></textarea>
                 </div>
 
             </div>
 
-        </div>
-
-    </div>
-
-    <!-- JUDUL HALAMAN -->
-    <div class="page-heading">
-
-        <div>
-            <h2>Ringkasan Dashboard</h2>
-
-            <p>
-                Pantau aktivitas laundry dan informasi operasional
-                berdasarkan data terbaru.
-            </p>
-        </div>
-
-    </div>
-
-    <!-- FILTER TANGGAL -->
-    <div class="filter-box">
-
-        <form method="GET">
-
-            <div class="filter-group">
-                <label>Tanggal Mulai</label>
-
-                <input
-                    type="date"
-                    name="tanggal_awal"
-                    value="<?= htmlspecialchars($tanggal_awal) ?>"
-                    required
-                >
-            </div>
-
-            <div class="filter-group">
-                <label>Tanggal Akhir</label>
-
-                <input
-                    type="date"
-                    name="tanggal_akhir"
-                    value="<?= htmlspecialchars($tanggal_akhir) ?>"
-                    required
-                >
-            </div>
-
-            <button type="submit" class="btn-filter">
-                <i class="fa-solid fa-filter"></i>
-                Terapkan
+            <button type="submit" class="btn btn-primary submit">
+                <i class="fa-solid fa-paper-plane"></i> Kirim Pesanan
             </button>
-
-            <a href="dashboard.php" class="btn-reset">
-                Reset
-            </a>
 
         </form>
 
-    </div>
-
-    <!-- =====================================
-         8 KARTU STATISTIK
-    ===================================== -->
-
-    <div class="cards">
-
-        <!-- PENDAPATAN -->
-        <div class="stat-card">
-
-            <div class="stat-top">
-                <div class="stat-icon blue">
-                    <i class="fa-solid fa-wallet"></i>
-                </div>
-
-                <span class="stat-label">
-                    Total Pendapatan
-                </span>
-            </div>
-
-            <h2><?= rupiah($total_pendapatan) ?></h2>
-
-            <small>Pembayaran berhasil pada periode ini</small>
-
-        </div>
-
-        <!-- TOTAL PESANAN -->
-        <div class="stat-card">
-
-            <div class="stat-top">
-                <div class="stat-icon green">
-                    <i class="fa-solid fa-box"></i>
-                </div>
-
-                <span class="stat-label">
-                    Total Pesanan
-                </span>
-            </div>
-
-            <h2><?= number_format($total_pesanan, 0, ",", ".") ?></h2>
-
-            <small>Pesanan masuk pada periode ini</small>
-
-        </div>
-
-        <!-- DIPROSES -->
-        <div class="stat-card">
-
-            <div class="stat-top">
-                <div class="stat-icon orange">
-                    <i class="fa-solid fa-shirt"></i>
-                </div>
-
-                <span class="stat-label">
-                    Sedang Diproses
-                </span>
-            </div>
-
-            <h2><?= number_format($total_proses, 0, ",", ".") ?></h2>
-
-            <small>Pesanan yang sedang dikerjakan</small>
-
-        </div>
-
-        <!-- SISA TAGIHAN -->
-        <div class="stat-card">
-
-            <div class="stat-top">
-                <div class="stat-icon purple">
-                    <i class="fa-solid fa-receipt"></i>
-                </div>
-
-                <span class="stat-label">
-                    Sisa Tagihan
-                </span>
-            </div>
-
-            <h2><?= rupiah($sisa_tagihan) ?></h2>
-
-            <small>Tagihan pesanan belum lunas</small>
-
-        </div>
-
-        <!-- TOTAL PELANGGAN -->
-        <div class="stat-card">
-
-            <div class="stat-top">
-                <div class="stat-icon cyan">
-                    <i class="fa-solid fa-users"></i>
-                </div>
-
-                <span class="stat-label">
-                    Total Pelanggan
-                </span>
-            </div>
-
-            <h2><?= number_format($total_pelanggan, 0, ",", ".") ?></h2>
-
-            <small>Seluruh data pelanggan</small>
-
-        </div>
-
-        <!-- TOTAL LAYANAN -->
-        <div class="stat-card">
-
-            <div class="stat-top">
-                <div class="stat-icon blue">
-                    <i class="fa-solid fa-soap"></i>
-                </div>
-
-                <span class="stat-label">
-                    Total Layanan
-                </span>
-            </div>
-
-            <h2><?= number_format($total_layanan, 0, ",", ".") ?></h2>
-
-            <small>Layanan laundry tersedia</small>
-
-        </div>
-
-        <!-- PEMBAYARAN BERHASIL -->
-        <div class="stat-card">
-
-            <div class="stat-top">
-                <div class="stat-icon green">
-                    <i class="fa-solid fa-circle-check"></i>
-                </div>
-
-                <span class="stat-label">
-                    Pembayaran Berhasil
-                </span>
-            </div>
-
-            <h2><?= number_format($pembayaran_berhasil, 0, ",", ".") ?></h2>
-
-            <small>Pembayaran pada periode ini</small>
-
-        </div>
-
-        <!-- PEMBAYARAN MENUNGGU -->
-        <div class="stat-card">
-
-            <div class="stat-top">
-                <div class="stat-icon red">
-                    <i class="fa-solid fa-clock"></i>
-                </div>
-
-                <span class="stat-label">
-                    Pembayaran Menunggu
-                </span>
-            </div>
-
-            <h2><?= number_format($pembayaran_menunggu, 0, ",", ".") ?></h2>
-
-            <small>Menunggu konfirmasi pembayaran</small>
-
-        </div>
+    <?php endif; ?>
 
     </div>
-
-    <!-- =====================================
-         GRAFIK
-    ===================================== -->
-
-    <div class="chart-grid">
-
-        <!-- GRAFIK PENDAPATAN -->
-        <div class="chart-box">
-
-            <div class="chart-title">
-                <i class="fa-solid fa-chart-line"></i>
-                Pendapatan pada Periode Terpilih
-            </div>
-
-            <div class="chart-container">
-                <canvas id="grafikPendapatan"></canvas>
-            </div>
-
-        </div>
-
-        <!-- GRAFIK STATUS -->
-        <div class="chart-box">
-
-            <div class="chart-title">
-                <i class="fa-solid fa-chart-pie"></i>
-                Pesanan Berdasarkan Status
-            </div>
-
-            <div class="chart-container">
-                <canvas id="grafikStatus"></canvas>
-            </div>
-
-        </div>
-
-    </div>
-
-    <!-- =====================================
-         ANALISIS PESANAN DAN PEMBAYARAN
-    ===================================== -->
-
-    <div class="table-box">
-
-        <div class="table-header">
-
-            <h3>Analisis Pesanan dan Pembayaran</h3>
-
-            <span>
-                10 pesanan terbaru pada periode terpilih
-            </span>
-
-        </div>
-
-        <table>
-
-            <thead>
-                <tr>
-                    <th>Kode Pesanan</th>
-                    <th>Pelanggan</th>
-                    <th>Tanggal Masuk</th>
-                    <th>Status</th>
-                    <th>Total Harga</th>
-                    <th>Sudah Dibayar</th>
-                    <th>Sisa Tagihan</th>
-                </tr>
-            </thead>
-
-            <tbody>
-
-            <?php if ($queryAnalisis && mysqli_num_rows($queryAnalisis) > 0): ?>
-
-                <?php while ($row = mysqli_fetch_assoc($queryAnalisis)): ?>
-
-                    <tr>
-
-                        <td>
-                            <?= htmlspecialchars($row["kode_pesanan"]) ?>
-                        </td>
-
-                        <td>
-                            <?= htmlspecialchars($row["nama_pelanggan"]) ?>
-                        </td>
-
-                        <td>
-                            <?= date("d-m-Y", strtotime($row["tanggal_masuk"])) ?>
-                        </td>
-
-                        <td>
-                            <span class="status">
-                                <?= htmlspecialchars($row["status"]) ?>
-                            </span>
-                        </td>
-
-                        <td>
-                            <?= rupiah($row["total_harga"]) ?>
-                        </td>
-
-                        <td>
-                            <?= rupiah($row["sudah_dibayar"]) ?>
-                        </td>
-
-                        <td>
-
-                            <?php if ($row["sisa_tagihan"] > 0): ?>
-
-                                <span class="tagihan">
-                                    <?= rupiah($row["sisa_tagihan"]) ?>
-                                </span>
-
-                            <?php else: ?>
-
-                                <span class="lunas">
-                                    Lunas
-                                </span>
-
-                            <?php endif; ?>
-
-                        </td>
-
-                    </tr>
-
-                <?php endwhile; ?>
-
-            <?php else: ?>
-
-                <tr>
-                    <td colspan="7" class="empty">
-                        Belum ada data pesanan pada periode ini.
-                    </td>
-                </tr>
-
-            <?php endif; ?>
-
-            </tbody>
-
-        </table>
-
-    </div>
-
-    <!-- =====================================
-         PESANAN TERBARU
-    ===================================== -->
-
-    <div class="table-box">
-
-        <div class="table-header">
-
-            <h3>Pesanan Terbaru</h3>
-
-            <span>5 pesanan terakhir</span>
-
-        </div>
-
-        <table>
-
-            <thead>
-                <tr>
-                    <th>Kode Pesanan</th>
-                    <th>Pelanggan</th>
-                    <th>Layanan</th>
-                    <th>Tanggal Masuk</th>
-                    <th>Total Harga</th>
-                    <th>Status</th>
-                </tr>
-            </thead>
-
-            <tbody>
-
-            <?php if ($queryTerbaru && mysqli_num_rows($queryTerbaru) > 0): ?>
-
-                <?php while ($row = mysqli_fetch_assoc($queryTerbaru)): ?>
-
-                    <tr>
-
-                        <td>
-                            <?= htmlspecialchars($row["kode_pesanan"]) ?>
-                        </td>
-
-                        <td>
-                            <?= htmlspecialchars($row["nama_pelanggan"]) ?>
-                        </td>
-
-                        <td>
-                            <?= htmlspecialchars($row["nama_layanan"]) ?>
-                        </td>
-
-                        <td>
-                            <?= date("d-m-Y", strtotime($row["tanggal_masuk"])) ?>
-                        </td>
-
-                        <td>
-                            <?= rupiah($row["total_harga"]) ?>
-                        </td>
-
-                        <td>
-                            <span class="status">
-                                <?= htmlspecialchars($row["status"]) ?>
-                            </span>
-                        </td>
-
-                    </tr>
-
-                <?php endwhile; ?>
-
-            <?php else: ?>
-
-                <tr>
-                    <td colspan="6" class="empty">
-                        Belum ada pesanan.
-                    </td>
-                </tr>
-
-            <?php endif; ?>
-
-            </tbody>
-
-        </table>
-
-    </div>
-
-    <div class="dashboard-footer">
-        © <?= date("Y") ?> Teman.Nyuci. All rights reserved.
-    </div>
-
 </div>
 
-<!-- =====================================
-     JAVASCRIPT GRAFIK
-===================================== -->
-
 <script>
+function hitung() {
+    const sel = document.getElementById("layanan");
+    const opt = sel.options[sel.selectedIndex];
+    const harga = parseFloat(opt.dataset.harga) || 0;
+    const est = parseInt(opt.dataset.estimasi) || 0;
+    const berat = parseFloat(document.getElementById("berat").value) || 0;
 
-// DATA DARI DATABASE
-const labelPendapatan = <?= json_encode($labelPendapatan) ?>;
-const dataPendapatan = <?= json_encode($dataPendapatan) ?>;
-
-const labelStatus = <?= json_encode($labelStatus) ?>;
-const dataStatus = <?= json_encode($dataStatus) ?>;
-
-// FORMAT RUPIAH
-function formatRupiah(value) {
-    return "Rp " + Number(value).toLocaleString("id-ID");
+    document.getElementById("estimasi").value = est > 0 ? est + " Hari" : "";
+    const total = harga * berat;
+    document.getElementById("total").value =
+        total > 0 ? "Rp " + total.toLocaleString("id-ID") : "";
 }
-
-// GRAFIK PENDAPATAN
-new Chart(document.getElementById("grafikPendapatan"), {
-
-    type: "line",
-
-    data: {
-        labels: labelPendapatan,
-
-        datasets: [{
-            label: "Pendapatan",
-            data: dataPendapatan,
-
-            borderColor: "#087FC1",
-            backgroundColor: "rgba(8,127,193,0.12)",
-
-            fill: true,
-            tension: 0.35,
-            borderWidth: 3,
-
-            pointBackgroundColor: "#087FC1",
-            pointBorderColor: "#FFFFFF",
-            pointBorderWidth: 2,
-            pointRadius: 4
-        }]
-    },
-
-    options: {
-
-        responsive: true,
-        maintainAspectRatio: false,
-
-        plugins: {
-
-            legend: {
-                display: false
-            },
-
-            tooltip: {
-                callbacks: {
-                    label: function(context) {
-                        return formatRupiah(context.raw);
-                    }
-                }
-            }
-
-        },
-
-        scales: {
-
-            y: {
-                beginAtZero: true,
-
-                grid: {
-                    color: "#EDF2F7"
-                },
-
-                ticks: {
-                    callback: function(value) {
-                        return formatRupiah(value);
-                    }
-                }
-            },
-
-            x: {
-                grid: {
-                    display: false
-                }
-            }
-
-        }
-
-    }
-
-});
-
-// GRAFIK STATUS PESANAN
-new Chart(document.getElementById("grafikStatus"), {
-
-    type: "doughnut",
-
-    data: {
-
-        labels: labelStatus,
-
-        datasets: [{
-
-            data: dataStatus,
-
-            backgroundColor: [
-                "#087FC1",
-                "#55B5E3",
-                "#8EC5F5",
-                "#A8D9D0",
-                "#F5C98B",
-                "#B8A8E8"
-            ],
-
-            borderWidth: 3,
-            borderColor: "#FFFFFF"
-
-        }]
-
-    },
-
-    options: {
-
-        responsive: true,
-        maintainAspectRatio: false,
-        cutout: "65%",
-
-        plugins: {
-
-            legend: {
-
-                position: "bottom",
-
-                labels: {
-                    usePointStyle: true,
-                    padding: 17,
-
-                    font: {
-                        size: 10
-                    }
-                }
-
-            }
-
-        }
-
-    }
-
-});
-
+hitung(); // isi otomatis kalau layanan sudah terpilih dari beranda
 </script>
 
 </body>
